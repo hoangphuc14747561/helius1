@@ -13,7 +13,7 @@ const WSOL = "So11111111111111111111111111111111111111112";
 const DELAY_MS = 2400;
 const ROUND_DELAY_MS = 500;
 const BATCH_SIZE = 5;
-const AMOUNT = 100_000_000;
+const TOKEN_TIMEOUT = 6000;
 
 let rpcUrls = [];
 
@@ -30,27 +30,78 @@ function loadRpcUrls() {
 
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
-async function getTokenPriceFromHelius(mint, heliusKey) {
-  const url = `https://api.helius.xyz/v0/tokens/price?api-key=${heliusKey}`;
+async function fetchWithTimeout(url, options = {}, timeout = TOKEN_TIMEOUT) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  options.signal = controller.signal;
   try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tokens: [mint] })
-    });
-    const data = await res.json();
-    const price = data?.prices?.[0]?.price;
-    if (price) return { value: +price.toFixed(9), source: "Helius" };
-  } catch {}
+    const res = await fetch(url, options);
+    clearTimeout(id);
+    return res;
+  } catch {
+    clearTimeout(id);
+    return null;
+  }
+}
+
+async function callRpc(rpcUrl, method, params) {
+  const options = {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })
+  };
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const response = await fetchWithTimeout(rpcUrl, options);
+    await delay(500);
+    if (response) {
+      try {
+        return await response.json();
+      } catch {}
+    }
+    await delay(1000);
+  }
   return null;
 }
 
-async function getTokenPriceWithTimeout(mint, timeout = 5000) {
-  const key = rpcUrls[Math.floor(Math.random() * rpcUrls.length)];
-  return Promise.race([
-    getTokenPriceFromHelius(mint, key),
-    new Promise(resolve => setTimeout(() => resolve(null), timeout))
-  ]);
+async function getTokenPriceAndInfo(mint, rpcUrl) {
+  try {
+    const largest = await callRpc(rpcUrl, "getTokenLargestAccounts", [mint]);
+    if (!largest?.result?.value?.length) return null;
+
+    const tokenAccount = largest.result.value[0].address;
+    const accountInfo = await callRpc(rpcUrl, "getAccountInfo", [tokenAccount, { encoding: "jsonParsed" }]);
+    const parsedInfo = accountInfo?.result?.value?.data?.parsed?.info;
+    const owner = parsedInfo?.owner;
+    const tokenAmount = parseFloat(parsedInfo?.tokenAmount?.uiAmount || 0);
+    if (!owner || tokenAmount === 0) return null;
+
+    const wsolAccounts = await callRpc(rpcUrl, "getTokenAccountsByOwner", [owner, { mint: WSOL }, { encoding: "jsonParsed" }]);
+    const wsolAmount = parseFloat(
+      wsolAccounts?.result?.value?.[0]?.account?.data?.parsed?.info?.tokenAmount?.uiAmount || 0
+    );
+
+    if (wsolAmount === 0) return "NO_POOL";
+
+    const supplyInfo = await callRpc(rpcUrl, "getTokenSupply", [mint]);
+    const supply = supplyInfo?.result?.value?.uiAmount ?? 0;
+    const topHolders = largest.result.value.slice(0, 10).map(acc => ({
+      address: acc.address,
+      amount: parseFloat(acc.uiAmountString || "0")
+    }));
+
+    return {
+      mint,
+      price: +(wsolAmount / tokenAmount).toFixed(9),
+      unit: "WSOL",
+      supply,
+      poolAddress: tokenAccount,
+      topHolders,
+      timestamp: Math.floor(Date.now() / 1000)
+    };
+  } catch {
+    return null;
+  }
 }
 
 async function assignBatchTokens(batchSize) {
@@ -91,14 +142,11 @@ async function scanRound(round) {
   const start = Date.now();
 
   for (const token of tokens) {
-    const price = await getTokenPriceWithTimeout(token.mint);
-    if (price) {
-      results.push({
-        mint: token.mint,
-        index: token.index ?? undefined,
-        currentPrice: price.value,
-        scanTime
-      });
+    const rpc = rpcUrls[Math.floor(Math.random() * rpcUrls.length)];
+    const priceData = await getTokenPriceAndInfo(token.mint, rpc);
+
+    if (priceData && priceData !== "NO_POOL") {
+      results.push({ ...priceData, index: token.index ?? undefined });
     } else {
       console.error(`❌ Không lấy được giá: ${token.mint}`);
     }
@@ -111,7 +159,9 @@ async function scanRound(round) {
     await delay(DELAY_MS);
   }
 
-  if (results.length > 0) await sendResults(results);
+  if (results.length > 0) {
+    await sendResults(results);
+  }
 }
 
 app.get("/", (req, res) => {
