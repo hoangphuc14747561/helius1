@@ -66,40 +66,73 @@ async function callRpc(rpcUrl, method, params) {
 
 async function getTokenPriceAndInfo(mint, rpcUrl) {
   try {
+    console.log(`🚀 Bắt đầu lấy giá token: ${mint}`);
+
     const largest = await callRpc(rpcUrl, "getTokenLargestAccounts", [mint]);
-    if (!largest?.result?.value?.length) return null;
+    if (!largest?.result?.value?.length) {
+      console.warn(`⚠️ [${mint}] Không có token account lớn nào.`);
+      return null;
+    }
 
     const tokenAccount = largest.result.value[0].address;
     const accountInfo = await callRpc(rpcUrl, "getAccountInfo", [tokenAccount, { encoding: "jsonParsed" }]);
     const parsedInfo = accountInfo?.result?.value?.data?.parsed?.info;
-    const owner = parsedInfo?.owner;
-    const tokenAmount = parseFloat(parsedInfo?.tokenAmount?.uiAmount || 0);
-    if (!owner || tokenAmount === 0) return null;
+
+    if (!parsedInfo) {
+      console.warn(`⚠️ [${mint}] Không đọc được parsed info từ account.`);
+      return null;
+    }
+
+    const owner = parsedInfo.owner;
+    const tokenAmount = parseFloat(parsedInfo.tokenAmount?.uiAmount || 0);
+
+    if (!owner) {
+      console.warn(`⚠️ [${mint}] Không tìm được owner của token account.`);
+      return null;
+    }
+
+    if (tokenAmount === 0) {
+      console.warn(`⚠️ [${mint}] tokenAmount = 0 (pool không có thanh khoản).`);
+      return null;
+    }
 
     const wsolAccounts = await callRpc(rpcUrl, "getTokenAccountsByOwner", [owner, { mint: WSOL }, { encoding: "jsonParsed" }]);
+    if (!wsolAccounts?.result?.value?.length) {
+      console.warn(`⚠️ [${mint}] Không tìm thấy WSOL account nào của owner.`);
+      return null;
+    }
+
     const wsolAmount = parseFloat(
-      wsolAccounts?.result?.value?.[0]?.account?.data?.parsed?.info?.tokenAmount?.uiAmount || 0
+      wsolAccounts.result.value[0]?.account?.data?.parsed?.info?.tokenAmount?.uiAmount || 0
     );
 
-    if (wsolAmount === 0) return "NO_POOL";
+    if (wsolAmount === 0) {
+      console.warn(`⚠️ [${mint}] WSOL amount = 0 (không có thanh khoản với WSOL).`);
+      return "NO_POOL";
+    }
 
     const supplyInfo = await callRpc(rpcUrl, "getTokenSupply", [mint]);
     const supply = supplyInfo?.result?.value?.uiAmount ?? 0;
+
     const topHolders = largest.result.value.slice(0, 10).map(acc => ({
       address: acc.address,
       amount: parseFloat(acc.uiAmountString || "0")
     }));
 
+    const price = +(wsolAmount / tokenAmount).toFixed(9);
+    console.log(`✅ [${mint}] Giá token = ${price} SOL`);
+
     return {
       mint,
-      price: +(wsolAmount / tokenAmount).toFixed(9),
+      price,
       unit: "WSOL",
       supply,
       poolAddress: tokenAccount,
       topHolders,
       timestamp: Math.floor(Date.now() / 1000)
     };
-  } catch {
+  } catch (err) {
+    console.error(`❌ [${mint}] Lỗi khi lấy giá:`, err.message || err);
     return null;
   }
 }
@@ -134,7 +167,6 @@ async function sendResults(results) {
 }
 
 async function scanRound(round) {
-  const scanTime = new Date().toLocaleTimeString("vi-VN", { hour12: false });
   const tokens = await assignBatchTokens(BATCH_SIZE);
   if (!tokens.length) return;
 
